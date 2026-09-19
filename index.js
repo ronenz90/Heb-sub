@@ -15,8 +15,8 @@ app.use((req, res, next) => {
 
 const manifest = {
   id: 'org.hebrewlivesubs.addon',
-  version: '1.2.0',
-  name: 'A-HEBSUB By Ronen.z',
+  version: '1.3.0',
+  name: 'תרגום חי by Ronen.z',
   description: 'לוקח כתוביות אנגלית קיימות ומתרגם אותן לעברית תוך כדי צפייה',
   logo: 'https://em-content.zobj.net/source/microsoft-teams/363/flag-israel_1f1ee-1f1f1.png',
   resources: ['subtitles'],
