@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
-import { fetchEnglishSrt, hasEnglishSubtitle } from './src/subtitleFetcher.js';
+import { getCandidates, downloadCandidate } from './src/subtitleFetcher.js';
 import { parseSrt, toSrt, translateCues } from './src/translator.js';
 import { getCached, setCached } from './src/cache.js';
 
@@ -15,7 +15,7 @@ app.use((req, res, next) => {
 
 const manifest = {
   id: 'org.hebrewlivesubs.addon',
-  version: '1.3.2',
+  version: '1.4.0',
   name: 'A-HEBSUB By Ronen.z',
   description: 'לוקח כתוביות אנגלית קיימות ומתרגם אותן לעברית תוך כדי צפייה',
   logo: 'https://em-content.zobj.net/source/microsoft-teams/363/flag-israel_1f1ee-1f1f1.png',
@@ -27,18 +27,29 @@ const manifest = {
 
 app.get('/manifest.json', (req, res) => res.json(manifest));
 
+const CANDIDATE_MARK = '__c';
+
 function parseIdParam(rawIdParam) {
-  const idParam = rawIdParam.replace(/\.json$/, '');
+  const withoutSuffix = rawIdParam.replace(/\.json$/, '').replace(/\.srt$/, '');
+  const markIndex = withoutSuffix.lastIndexOf(CANDIDATE_MARK);
+
+  let idParam = withoutSuffix;
+  let candidateIndex = 0;
+  if (markIndex !== -1) {
+    idParam = withoutSuffix.slice(0, markIndex);
+    candidateIndex = parseInt(withoutSuffix.slice(markIndex + CANDIDATE_MARK.length), 10) || 0;
+  }
+
   const [imdbId, season, episode] = idParam.split(':');
-  return { idParam, imdbId, season, episode };
+  return { idParam, imdbId, season, episode, candidateIndex };
 }
 
 // Keeps track of the "quick" build currently in progress per subtitle, so two
 // near-simultaneous requests for the same subtitle share the same fast pass
-// instead of each independently hitting OpenSubtitles/Google Translate.
+// instead of each independently hitting sources/Google Translate.
 const inFlight = new Map();
 
-async function getOrBuildTranslatedSrt(cacheKey, imdbId, season, episode) {
+async function getOrBuildTranslatedSrt(cacheKey, candidate) {
   const cached = getCached(cacheKey);
   if (cached) return cached;
 
@@ -46,10 +57,10 @@ async function getOrBuildTranslatedSrt(cacheKey, imdbId, season, episode) {
 
   const buildPromise = (async () => {
     try {
-      console.log(`[${cacheKey}] Fetching English subtitle...`);
-      const englishSrt = await fetchEnglishSrt(imdbId, season, episode);
+      console.log(`[${cacheKey}] Downloading candidate (${candidate.source})...`);
+      const englishSrt = await downloadCandidate(candidate);
       if (!englishSrt) {
-        console.log(`[${cacheKey}] No English subtitle found`);
+        console.log(`[${cacheKey}] Candidate download returned nothing`);
         return null;
       }
 
@@ -60,8 +71,8 @@ async function getOrBuildTranslatedSrt(cacheKey, imdbId, season, episode) {
       console.log(`[${cacheKey}] Translating first ${quickCues.length} cues (fast pass)...`);
       await translateCues(quickCues, 'iw');
 
-      // Partial file: start of the movie in Hebrew, the rest still in English
-      // for now. This is what we return immediately.
+      // Partial file: start of the movie in Hebrew, the rest still in the
+      // original language for now. This is what we return immediately.
       const partialSrt = toSrt([...quickCues, ...restCues]);
       setCached(cacheKey, partialSrt);
       console.log(`[${cacheKey}] Fast pass cached (${quickCues.length}/${cues.length} cues translated).`);
@@ -90,53 +101,59 @@ async function getOrBuildTranslatedSrt(cacheKey, imdbId, season, episode) {
   return buildPromise;
 }
 
-// LIST endpoint: must respond fast. Only does a quick existence check
-// (single search call) — never downloads or translates here.
+// LIST endpoint: must respond fast. Only searches for candidates (no
+// download or translation here) and offers each one as its own row, so the
+// person can try another if the first is the wrong language or out of sync.
 app.get('/subtitles/:type/:idParam/:extra?', async (req, res) => {
   try {
     const { idParam, imdbId, season, episode } = parseIdParam(req.params.idParam);
     console.log(`[LIST] Request for type=${req.params.type} id=${idParam}${req.params.extra ? ` extra=${req.params.extra}` : ''}`);
-    const cacheKey = `heb_${idParam}`;
     const baseUrl = `${req.protocol}://${req.get('host')}`;
-    const subtitleEntry = {
-      id: `heb-${idParam}`,
-      url: `${baseUrl}/subs/${req.params.type}/${encodeURIComponent(idParam)}.srt`,
+
+    const candidates = await getCandidates(imdbId, season, episode);
+    console.log(`[LIST] ${idParam}: found ${candidates.length} candidate(s)`);
+    if (!candidates.length) return res.json({ subtitles: [] });
+
+    const subtitles = candidates.map((candidate, i) => ({
+      id: `heb-${idParam}-${i}`,
+      url: `${baseUrl}/subs/${req.params.type}/${encodeURIComponent(idParam + CANDIDATE_MARK + i)}.srt`,
       lang: 'heb',
-    };
+    }));
 
-    // If we already have something cached (partial or full), we know for
-    // certain a subtitle exists — no need for an extra search call.
-    if (getCached(cacheKey)) {
-      return res.json({ subtitles: [subtitleEntry] });
-    }
-
-    const exists = await hasEnglishSubtitle(imdbId, season, episode);
-    console.log(`[LIST] ${idParam}: English subtitle exists = ${exists}`);
-    if (!exists) return res.json({ subtitles: [] });
-
-    res.json({ subtitles: [subtitleEntry] });
+    res.json({ subtitles });
   } catch (err) {
     console.error('Error handling subtitles list request:', err);
     res.json({ subtitles: [] });
   }
 });
 
-// FILE endpoint: fetches English subtitle + does the fast first-30-cues
+// FILE endpoint: re-fetches candidates for this title (to know which one the
+// requested index refers to), downloads that one, does the fast first-30-cues
 // translation synchronously, then keeps translating the rest in the
 // background. Re-requesting this URL later returns whatever is cached at
 // that point (which will be more complete, up to the full file).
 app.get('/subs/:type/:idParam', async (req, res) => {
   try {
-    const { idParam, imdbId, season, episode } = parseIdParam(
-      req.params.idParam.replace(/\.srt$/, '')
-    );
-    const cacheKey = `heb_${idParam}`;
+    const { idParam, imdbId, season, episode, candidateIndex } = parseIdParam(req.params.idParam);
+    const cacheKey = `heb_${idParam}_c${candidateIndex}`;
 
-    const srt = await getOrBuildTranslatedSrt(cacheKey, imdbId, season, episode);
-    if (!srt) return res.status(404).send('No subtitle available');
+    if (!getCached(cacheKey) && !inFlight.has(cacheKey)) {
+      const candidates = await getCandidates(imdbId, season, episode);
+      const candidate = candidates[candidateIndex];
+      if (!candidate) return res.status(404).send('Candidate not found');
 
+      const srt = await getOrBuildTranslatedSrt(cacheKey, candidate);
+      if (!srt) return res.status(404).send('No subtitle available');
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      return res.send(srt);
+    }
+
+    // Already cached or already building — just await/return it (candidate
+    // details aren't needed again once the build is in flight or done).
+    const cachedOrPending = getCached(cacheKey) || (await inFlight.get(cacheKey));
+    if (!cachedOrPending) return res.status(404).send('No subtitle available');
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.send(srt);
+    res.send(cachedOrPending);
   } catch (err) {
     console.error('Error handling subtitle file request:', err);
     res.status(500).send('Error generating subtitle');
