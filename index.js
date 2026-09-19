@@ -92,10 +92,10 @@ async function getOrBuildTranslatedSrt(cacheKey, imdbId, season, episode) {
 
 // LIST endpoint: must respond fast. Only does a quick existence check
 // (single search call) — never downloads or translates here.
-app.get('/subtitles/:type/:idParam', async (req, res) => {
+app.get('/subtitles/:type/:idParam/:extra?', async (req, res) => {
   try {
     const { idParam, imdbId, season, episode } = parseIdParam(req.params.idParam);
-    console.log(`[LIST] Request for type=${req.params.type} id=${idParam}`);
+    console.log(`[LIST] Request for type=${req.params.type} id=${idParam}${req.params.extra ? ` extra=${req.params.extra}` : ''}`);
     const cacheKey = `heb_${idParam}`;
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     const subtitleEntry = {
@@ -145,6 +145,13 @@ app.get('/subs/:type/:idParam', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.send('Hebrew Live Subs addon is running. Install via /manifest.json');
+});
+
+// Safety net: logs any request that didn't match a route above, so we can
+// spot unexpected URL shapes Stremio (or a player) might be sending.
+app.use((req, res) => {
+  console.log(`[404] ${req.method} ${req.originalUrl}`);
+  res.status(404).send('Not found');
 });
 
 app.listen(PORT, '0.0.0.0', () => {
