@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: hebrew-live-subs
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: OS_API_KEY
+        sync: false
