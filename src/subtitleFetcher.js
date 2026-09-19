@@ -8,12 +8,7 @@ function headers() {
   };
 }
 
-/**
- * Searches OpenSubtitles for the best-matching English subtitle
- * for a movie (imdbId) or an episode (imdbId + season + episode).
- * Returns the raw .srt text, or null if none found.
- */
-export async function fetchEnglishSrt(imdbId, season, episode) {
+async function searchBest(imdbId, season, episode) {
   const params = new URLSearchParams({
     imdb_id: imdbId.replace('tt', ''),
     languages: 'en',
@@ -28,7 +23,27 @@ export async function fetchEnglishSrt(imdbId, season, episode) {
     throw new Error(`OpenSubtitles search failed: ${searchRes.status} ${await searchRes.text()}`);
   }
   const searchData = await searchRes.json();
-  const best = searchData.data?.[0];
+  return searchData.data?.[0] || null;
+}
+
+/**
+ * Fast check (a single search call, no download) used to decide whether to
+ * even offer a Hebrew subtitle option in the subtitles list.
+ */
+export async function hasEnglishSubtitle(imdbId, season, episode) {
+  const best = await searchBest(imdbId, season, episode);
+  return !!best?.attributes?.files?.[0]?.file_id;
+}
+
+/**
+ * Searches OpenSubtitles for the best-matching English subtitle
+ * for a movie (imdbId) or an episode (imdbId + season + episode).
+ * Returns the raw .srt text, or null if none found.
+ * This does a search + download, so it's the slower path — call it only
+ * when actually generating the subtitle file, not when listing options.
+ */
+export async function fetchEnglishSrt(imdbId, season, episode) {
+  const best = await searchBest(imdbId, season, episode);
   if (!best) return null;
 
   const fileId = best.attributes.files?.[0]?.file_id;

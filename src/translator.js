@@ -9,6 +9,7 @@ const parser = new SrtParser2();
 // back apart. This keeps translation of a full movie to a handful of calls.
 const BATCH_CHAR_LIMIT = 4000;
 const SEPARATOR = '\n@@|@@\n';
+const CONCURRENCY = 4;
 
 function chunkCues(cues) {
   const chunks = [];
@@ -42,22 +43,59 @@ async function translateChunk(cues, targetLang) {
   return parts.map(p => p.trim());
 }
 
+async function translateAllChunks(chunks, targetLang) {
+  const results = new Array(chunks.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < chunks.length) {
+      const i = nextIndex++;
+      results[i] = await translateChunk(chunks[i], targetLang);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
+export function parseSrt(srtContent) {
+  return parser.fromSrt(srtContent);
+}
+
+export function toSrt(cues) {
+  return parser.toSrt(cues);
+}
+
 /**
- * Translates a full SRT file's text content to targetLang (e.g. 'iw' for Hebrew),
- * preserving all timing/index information.
+ * Translates an array of srt-parser-2 cue objects IN PLACE (mutates .text),
+ * and also returns them. Handles chunking + parallel requests internally,
+ * so it's safe to call with anywhere from a handful of cues to a whole movie.
  */
-export async function translateSrt(srtContent, targetLang = 'iw') {
-  const cues = parser.fromSrt(srtContent);
+export async function translateCues(cues, targetLang = 'iw') {
+  if (!cues.length) return cues;
   const chunks = chunkCues(cues);
+  const translatedChunks = await translateAllChunks(chunks, targetLang);
 
   let cursor = 0;
-  for (const chunk of chunks) {
-    const translatedTexts = await translateChunk(chunk, targetLang);
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c];
+    const translatedTexts = translatedChunks[c];
     for (let i = 0; i < chunk.length; i++) {
       cues[cursor + i].text = translatedTexts[i] ?? chunk[i].text;
     }
     cursor += chunk.length;
   }
+  return cues;
+}
 
-  return parser.toSrt(cues);
+/**
+ * Translates a full SRT file's text content to targetLang (e.g. 'iw' for Hebrew),
+ * preserving all timing/index information. Convenience wrapper around
+ * parseSrt + translateCues + toSrt for simple one-shot use.
+ */
+export async function translateSrt(srtContent, targetLang = 'iw') {
+  const cues = parseSrt(srtContent);
+  await translateCues(cues, targetLang);
+  return toSrt(cues);
 }
