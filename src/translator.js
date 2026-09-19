@@ -28,8 +28,13 @@ function isRateLimitError(err) {
 // own circuit breaker (a cooldown window once it rate-limits us), and each
 // is tried only when the one before it is unavailable or fails.
 
+const CONSECUTIVE_FAILURE_LIMIT = 3;
+const NETWORK_FAILURE_COOLDOWN_MS = 5 * 60_000; // 5 minutes — a network-level block (e.g. the mirror blocking cloud IPs) won't clear itself in a minute
+
 function makeEngine({ name, paceMs, translateOne }) {
   let blockedUntil = 0;
+  let consecutiveFailures = 0;
+
   return {
     name,
     async translateChunk(cues, targetLang) {
@@ -43,14 +48,26 @@ function makeEngine({ name, paceMs, translateOne }) {
         try {
           const text = await translateOne(cue.text.replace(/\r?\n/g, ' '), targetLang);
           results.push(text);
+          consecutiveFailures = 0;
         } catch (err) {
-          if (isRateLimitError(err)) {
-            console.error(`${name} rate-limited us — cooling down for 60s.`);
-            blockedUntil = Date.now() + COOLDOWN_MS;
+          consecutiveFailures++;
+          const rateLimited = isRateLimitError(err);
+          const tooManyFailures = consecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT;
+
+          if (rateLimited || tooManyFailures) {
+            const cooldown = rateLimited ? COOLDOWN_MS : NETWORK_FAILURE_COOLDOWN_MS;
+            console.error(
+              rateLimited
+                ? `${name} rate-limited us — cooling down for ${cooldown / 1000}s.`
+                : `${name} failed ${consecutiveFailures} times in a row (${err.message}) — assuming it's down, cooling down for ${cooldown / 1000}s.`
+            );
+            blockedUntil = Date.now() + cooldown;
+            consecutiveFailures = 0;
             // Fill remaining lines with originals and bail on this engine.
             results.push(...cues.slice(i).map(c => c.text));
             return results;
           }
+
           console.error(`${name} failed for a line:`, err.message);
           results.push(cue.text);
         }
@@ -76,22 +93,38 @@ const myMemory = makeEngine({
   },
 });
 
+const LIBRETRANSLATE_MIRRORS = [
+  'https://translate.argosopentech.com/translate',
+  'https://libretranslate.de/translate',
+  'https://translate.mentality.rip/translate',
+];
+
 const libreTranslate = makeEngine({
   name: 'LibreTranslate',
   paceMs: 1500,
   translateOne: async (text, targetLang) => {
     const lang = targetLang === 'iw' ? 'he' : targetLang;
-    // Community-run free mirror (no API key). Can be slower/less reliable
-    // than the official paid libretranslate.com, but costs nothing.
-    const res = await fetch('https://translate.argosopentech.com/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: text, source: 'en', target: lang, format: 'text' }),
-    });
-    if (!res.ok) throw new Error(`LibreTranslate failed: ${res.status}`);
-    const data = await res.json();
-    if (!data.translatedText) throw new Error('LibreTranslate returned no translation');
-    return data.translatedText;
+    // Community-run free mirrors (no API key). Any one of them can be down
+    // or slow at a given moment since they're volunteer-run, so we try a
+    // few in turn before giving up on this engine for this line.
+    let lastErr;
+    for (const mirror of LIBRETRANSLATE_MIRRORS) {
+      try {
+        const res = await fetch(mirror, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ q: text, source: 'en', target: lang, format: 'text' }),
+        });
+        if (!res.ok) throw new Error(`${mirror} returned ${res.status}`);
+        const data = await res.json();
+        if (!data.translatedText) throw new Error(`${mirror} returned no translation`);
+        return data.translatedText;
+      } catch (err) {
+        lastErr = err;
+        // try the next mirror
+      }
+    }
+    throw lastErr || new Error('All LibreTranslate mirrors failed');
   },
 });
 
@@ -109,6 +142,7 @@ async function translateChunkViaFallbacks(cues, targetLang) {
 // --- Google (primary) ----------------------------------------------------
 
 let googleBlockedUntil = 0;
+let googleConsecutiveFailures = 0;
 
 function chunkCues(cues) {
   const chunks = [];
@@ -137,6 +171,7 @@ async function translateChunk(cues, targetLang) {
       try {
         const { text } = await translate(joined, { to: targetLang });
         await sleep(500); // pace even successful calls
+        googleConsecutiveFailures = 0;
         const parts = text.split(SEPARATOR.trim());
 
         if (parts.length !== cues.length) {
@@ -145,7 +180,15 @@ async function translateChunk(cues, targetLang) {
         }
         return parts.map(p => p.trim());
       } catch (err) {
-        if (!isRateLimitError(err)) break;
+        if (!isRateLimitError(err)) {
+          googleConsecutiveFailures++;
+          if (googleConsecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT) {
+            console.error(`Google failed ${googleConsecutiveFailures} times in a row (${err.message}) — assuming it's unreachable, cooling down for 5min.`);
+            googleBlockedUntil = Date.now() + NETWORK_FAILURE_COOLDOWN_MS;
+            googleConsecutiveFailures = 0;
+          }
+          break;
+        }
         if (attempt === MAX_RETRIES) {
           console.error('Google rate-limited us repeatedly — cooling down for 60s.');
           googleBlockedUntil = Date.now() + COOLDOWN_MS;
