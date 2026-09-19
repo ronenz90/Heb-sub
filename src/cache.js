@@ -20,3 +20,8 @@ export function getCached(key) {
 export function setCached(key, content) {
   fs.writeFileSync(keyToPath(key), content, 'utf-8');
 }
+
+export function deleteCached(key) {
+  const p = keyToPath(key);
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+}
