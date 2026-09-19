@@ -43,7 +43,10 @@ async function downloadFromOpenSubtitles(fileId) {
     body: JSON.stringify({ file_id: fileId }),
   });
   if (!downloadRes.ok) {
-    throw new Error(`OpenSubtitles download failed: ${downloadRes.status} ${await downloadRes.text()}`);
+    const body = await downloadRes.text();
+    const err = new Error(`OpenSubtitles download failed: ${downloadRes.status} ${body}`);
+    err.isQuotaExceeded = downloadRes.status === 406 && /allowed \d+ subtitles/i.test(body);
+    throw err;
   }
   const downloadData = await downloadRes.json();
 
@@ -87,6 +90,15 @@ async function downloadFromSubDL(url) {
   return srtEntry.getData().toString('utf-8');
 }
 
+// Once OpenSubtitles tells us the daily download quota is used up, remember
+// that for the rest of the process instead of hitting the same wall on every
+// single candidate download — the quota is account-wide, not per-file.
+let osQuotaExceededUntil = 0;
+
+function osQuotaLikelyExceeded() {
+  return Date.now() < osQuotaExceededUntil;
+}
+
 // ---------- Public API ----------
 
 /**
@@ -100,15 +112,17 @@ async function downloadFromSubDL(url) {
 export async function getCandidates(imdbId, season, episode) {
   const candidates = [];
 
-  try {
-    const results = await searchOpenSubtitles(imdbId, season, episode);
-    for (const r of results) {
-      const fileId = r.attributes?.files?.[0]?.file_id;
-      if (fileId) candidates.push({ source: 'opensubtitles', fileId });
-      if (candidates.length >= MAX_CANDIDATES) break;
+  if (!osQuotaLikelyExceeded()) {
+    try {
+      const results = await searchOpenSubtitles(imdbId, season, episode);
+      for (const r of results) {
+        const fileId = r.attributes?.files?.[0]?.file_id;
+        if (fileId) candidates.push({ source: 'opensubtitles', fileId });
+        if (candidates.length >= MAX_CANDIDATES) break;
+      }
+    } catch (err) {
+      console.error('OpenSubtitles search failed:', err.message);
     }
-  } catch (err) {
-    console.error('OpenSubtitles search failed:', err.message);
   }
 
   if (candidates.length < MAX_CANDIDATES && subdlEnabled()) {
@@ -123,9 +137,32 @@ export async function getCandidates(imdbId, season, episode) {
   return candidates;
 }
 
-/** Downloads the actual .srt text for one candidate returned by getCandidates(). */
-export async function downloadCandidate(candidate) {
-  if (candidate.source === 'opensubtitles') return downloadFromOpenSubtitles(candidate.fileId);
+/**
+ * Downloads the actual .srt text for one candidate returned by getCandidates().
+ * If an OpenSubtitles candidate fails specifically because the daily download
+ * quota is exhausted, transparently substitutes a SubDL result instead of
+ * failing outright (when SubDL is configured).
+ */
+export async function downloadCandidate(candidate, imdbId, season, episode) {
   if (candidate.source === 'subdl') return downloadFromSubDL(candidate.url);
+
+  if (candidate.source === 'opensubtitles') {
+    try {
+      return await downloadFromOpenSubtitles(candidate.fileId);
+    } catch (err) {
+      if (!err.isQuotaExceeded) throw err;
+
+      console.error('OpenSubtitles quota exhausted — remembering this for later requests too.');
+      osQuotaExceededUntil = Date.now() + 60 * 60 * 1000; // recheck in an hour, in case it resets early
+
+      if (subdlEnabled()) {
+        console.log('Falling back to SubDL in place of the quota-exhausted OpenSubtitles candidate...');
+        const best = await searchBestOnSubDL(imdbId, season, episode);
+        if (best?.url) return downloadFromSubDL(best.url);
+      }
+      throw err;
+    }
+  }
+
   return null;
 }
