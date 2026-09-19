@@ -3,6 +3,9 @@ import express from 'express';
 import { getCandidates, downloadCandidate } from './src/subtitleFetcher.js';
 import { parseSrt, toSrt, translateCues } from './src/translator.js';
 import { getCached, setCached } from './src/cache.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const PORT = process.env.PORT || 7000;
 const QUICK_COUNT = 30; // how many cues to translate immediately before returning
@@ -15,7 +18,7 @@ app.use((req, res, next) => {
 
 const manifest = {
   id: 'org.hebrewlivesubs.addon',
-  version: '1.4.1',
+  version: '1.4.2',
   name: 'A-HEBSUB By Ronen.z',
   description: 'לוקח כתוביות אנגלית קיימות ומתרגם אותן לעברית תוך כדי צפייה',
   logo: 'https://em-content.zobj.net/source/microsoft-teams/363/flag-israel_1f1ee-1f1f1.png',
@@ -44,6 +47,17 @@ function parseIdParam(rawIdParam) {
   return { idParam, imdbId, season, episode, candidateIndex };
 }
 
+// Heuristic: Hebrew text looks nothing like English, so if translation truly
+// ran, cue text should have changed for most lines. If most lines are byte-
+// for-byte identical to the original, every engine was almost certainly
+// down/blocked for this whole batch rather than the text genuinely having
+// no translatable content.
+function translationLooksReal(beforeTexts, cues) {
+  if (!cues.length) return true;
+  const changed = cues.filter((c, i) => c.text !== beforeTexts[i]).length;
+  return changed / cues.length >= 0.5;
+}
+
 // Keeps track of the "quick" build currently in progress per subtitle, so two
 // near-simultaneous requests for the same subtitle share the same fast pass
 // instead of each independently hitting sources/Google Translate.
@@ -69,19 +83,37 @@ async function getOrBuildTranslatedSrt(cacheKey, candidate, imdbId, season, epis
       const restCues = cues.slice(QUICK_COUNT);
 
       console.log(`[${cacheKey}] Translating first ${quickCues.length} cues (fast pass)...`);
+      const beforeQuick = quickCues.map(c => c.text);
       await translateCues(quickCues, 'iw');
+      const quickSucceeded = translationLooksReal(beforeQuick, quickCues);
+
+      const partialSrt = toSrt([...quickCues, ...restCues]);
+
+      if (!quickSucceeded) {
+        // Every translation engine was down/blocked right now — the text
+        // came back unchanged. Don't cache this as if it were final, or
+        // every future request for this title would be stuck serving
+        // untranslated English forever. Return it for just this request;
+        // the next request will start over and try again from scratch.
+        console.error(`[${cacheKey}] Translation appears to have failed entirely (engines likely down) — not caching, will retry next request.`);
+        return partialSrt;
+      }
 
       // Partial file: start of the movie in Hebrew, the rest still in the
       // original language for now. This is what we return immediately.
-      const partialSrt = toSrt([...quickCues, ...restCues]);
       setCached(cacheKey, partialSrt);
       console.log(`[${cacheKey}] Fast pass cached (${quickCues.length}/${cues.length} cues translated).`);
 
       // Continue translating the rest in the background, without blocking
       // the response. Once done, overwrite the cache with the full version.
       if (restCues.length) {
+        const beforeRest = restCues.map(c => c.text);
         translateCues(restCues, 'iw')
           .then(() => {
+            if (!translationLooksReal(beforeRest, restCues)) {
+              console.error(`[${cacheKey}] Background translation looks like it failed too — leaving the earlier (partial) cache in place instead of overwriting it with untranslated text.`);
+              return;
+            }
             const fullSrt = toSrt([...quickCues, ...restCues]);
             setCached(cacheKey, fullSrt);
             console.log(`[${cacheKey}] Background translation complete — full file cached.`);
@@ -162,6 +194,26 @@ app.get('/subs/:type/:idParam', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.send('Hebrew Live Subs addon is running. Install via /manifest.json');
+});
+
+// Manual cache wipe, for when a stale/failed translation got cached and you
+// don't want to wait for the next redeploy (which also clears it). No auth —
+// fine for a personal addon whose URL isn't public, but don't share this URL.
+app.get('/admin/clear-cache', (req, res) => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const cacheDir = path.join(__dirname, 'cache');
+  let cleared = 0;
+  try {
+    for (const file of fs.readdirSync(cacheDir)) {
+      if (file.endsWith('.srt')) {
+        fs.unlinkSync(path.join(cacheDir, file));
+        cleared++;
+      }
+    }
+    res.send(`Cleared ${cleared} cached subtitle file(s).`);
+  } catch (err) {
+    res.status(500).send(`Error clearing cache: ${err.message}`);
+  }
 });
 
 // Safety net: logs any request that didn't match a route above, so we can
