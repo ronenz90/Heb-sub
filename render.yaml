@@ -9,3 +9,5 @@ services:
     envVars:
       - key: OS_API_KEY
         sync: false
+      - key: SUBDL_API_KEY
+        sync: false
