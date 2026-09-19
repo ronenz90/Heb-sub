@@ -100,7 +100,7 @@ app.get('/subtitles/:type/:idParam', async (req, res) => {
     const subtitleEntry = {
       id: `heb-${idParam}`,
       url: `${baseUrl}/subs/${req.params.type}/${encodeURIComponent(idParam)}.srt`,
-      lang: 'heb',
+      lang: 'עברית by Ronen.z',
     };
 
     // If we already have something cached (partial or full), we know for
