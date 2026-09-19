@@ -95,6 +95,7 @@ async function getOrBuildTranslatedSrt(cacheKey, imdbId, season, episode) {
 app.get('/subtitles/:type/:idParam', async (req, res) => {
   try {
     const { idParam, imdbId, season, episode } = parseIdParam(req.params.idParam);
+    console.log(`[LIST] Request for type=${req.params.type} id=${idParam}`);
     const cacheKey = `heb_${idParam}`;
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     const subtitleEntry = {
@@ -110,6 +111,7 @@ app.get('/subtitles/:type/:idParam', async (req, res) => {
     }
 
     const exists = await hasEnglishSubtitle(imdbId, season, episode);
+    console.log(`[LIST] ${idParam}: English subtitle exists = ${exists}`);
     if (!exists) return res.json({ subtitles: [] });
 
     res.json({ subtitles: [subtitleEntry] });
