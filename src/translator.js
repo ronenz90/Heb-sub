@@ -9,7 +9,12 @@ const parser = new SrtParser2();
 // back apart. This keeps translation of a full movie to a handful of calls.
 const BATCH_CHAR_LIMIT = 4000;
 const SEPARATOR = '\n@@|@@\n';
-const CONCURRENCY = 4;
+const CONCURRENCY = 2; // lower concurrency = gentler on Google's unofficial endpoint
+const MAX_RETRIES = 3;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function chunkCues(cues) {
   const chunks = [];
@@ -32,15 +37,32 @@ function chunkCues(cues) {
 
 async function translateChunk(cues, targetLang) {
   const joined = cues.map(c => c.text.replace(/\r?\n/g, ' ')).join(SEPARATOR);
-  const { text } = await translate(joined, { to: targetLang });
-  const parts = text.split(SEPARATOR.trim());
 
-  // Fallback: if the separator got mangled by translation, split by line count
-  if (parts.length !== cues.length) {
-    const fallbackParts = text.split(/\n+/).filter(Boolean);
-    return cues.map((c, i) => fallbackParts[i] || c.text);
+  let lastErr;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const { text } = await translate(joined, { to: targetLang });
+      const parts = text.split(SEPARATOR.trim());
+
+      // Fallback: if the separator got mangled by translation, split by line count
+      if (parts.length !== cues.length) {
+        const fallbackParts = text.split(/\n+/).filter(Boolean);
+        return cues.map((c, i) => fallbackParts[i] || c.text);
+      }
+      return parts.map(p => p.trim());
+    } catch (err) {
+      lastErr = err;
+      const isRateLimit = /Too Many Requests|429/i.test(err.message || '');
+      if (!isRateLimit || attempt === MAX_RETRIES) break;
+      const waitMs = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+      console.log(`Rate limited by translate endpoint, retrying in ${waitMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})...`);
+      await sleep(waitMs);
+    }
   }
-  return parts.map(p => p.trim());
+  // Give up gracefully: return original (untranslated) text rather than
+  // failing the whole subtitle file over one bad chunk.
+  console.error('Translation chunk failed after retries:', lastErr?.message);
+  return cues.map(c => c.text);
 }
 
 async function translateAllChunks(chunks, targetLang) {
