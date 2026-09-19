@@ -10,41 +10,105 @@ const parser = new SrtParser2();
 const BATCH_CHAR_LIMIT = 4000;
 const SEPARATOR = '\n@@|@@\n';
 const CONCURRENCY = 1; // fully serial — gentlest possible on the unofficial endpoint
-const MAX_RETRIES = 3;
-
-// MyMemory doesn't need an API key and has its own independent (small) free
-// quota, so it's a reasonable last-resort when Google is rate-limiting hard.
-// It only accepts short-ish text per request, so we translate cue-by-cue.
-const MYMEMORY_LANG = { iw: 'he', he: 'he' };
+const MAX_RETRIES = 2;
+const COOLDOWN_MS = 60_000; // 1 minute, shared shape for every engine's circuit breaker
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function translateViaMyMemory(text, targetLang) {
-  const lang = MYMEMORY_LANG[targetLang] || targetLang;
-  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|${lang}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`MyMemory failed: ${res.status}`);
-  const data = await res.json();
-  const translated = data.responseData?.translatedText;
-  if (!translated) throw new Error('MyMemory returned no translation');
-  return translated;
+function isRateLimitError(err) {
+  return /Too Many Requests|429/i.test(err?.message || '');
 }
 
-async function translateChunkViaMyMemory(cues, targetLang) {
-  const results = [];
-  for (const cue of cues) {
-    try {
-      const text = await translateViaMyMemory(cue.text.replace(/\r?\n/g, ' '), targetLang);
-      results.push(text);
-    } catch (err) {
-      console.error('MyMemory fallback failed for a line:', err.message);
-      results.push(cue.text); // give up on just this one line, keep going
-    }
-  }
-  return results;
+// --- Generic per-cue fallback engine runner ------------------------------
+// Both MyMemory and LibreTranslate's free public mirrors only accept one
+// short text per request (no batching), have small/unclear quotas, and are
+// run by volunteers — so every engine here gets its own pacing delay and its
+// own circuit breaker (a cooldown window once it rate-limits us), and each
+// is tried only when the one before it is unavailable or fails.
+
+function makeEngine({ name, paceMs, translateOne }) {
+  let blockedUntil = 0;
+  return {
+    name,
+    async translateChunk(cues, targetLang) {
+      if (Date.now() < blockedUntil) {
+        console.log(`${name} still in cooldown, skipping.`);
+        return null; // signal "try the next engine"
+      }
+      const results = [];
+      for (let i = 0; i < cues.length; i++) {
+        const cue = cues[i];
+        try {
+          const text = await translateOne(cue.text.replace(/\r?\n/g, ' '), targetLang);
+          results.push(text);
+        } catch (err) {
+          if (isRateLimitError(err)) {
+            console.error(`${name} rate-limited us — cooling down for 60s.`);
+            blockedUntil = Date.now() + COOLDOWN_MS;
+            // Fill remaining lines with originals and bail on this engine.
+            results.push(...cues.slice(i).map(c => c.text));
+            return results;
+          }
+          console.error(`${name} failed for a line:`, err.message);
+          results.push(cue.text);
+        }
+        await sleep(paceMs);
+      }
+      return results;
+    },
+  };
 }
+
+const myMemory = makeEngine({
+  name: 'MyMemory',
+  paceMs: 1200,
+  translateOne: async (text, targetLang) => {
+    const lang = targetLang === 'iw' ? 'he' : targetLang;
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|${lang}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`MyMemory failed: ${res.status}`);
+    const data = await res.json();
+    const translated = data.responseData?.translatedText;
+    if (!translated) throw new Error('MyMemory returned no translation');
+    return translated;
+  },
+});
+
+const libreTranslate = makeEngine({
+  name: 'LibreTranslate',
+  paceMs: 1500,
+  translateOne: async (text, targetLang) => {
+    const lang = targetLang === 'iw' ? 'he' : targetLang;
+    // Community-run free mirror (no API key). Can be slower/less reliable
+    // than the official paid libretranslate.com, but costs nothing.
+    const res = await fetch('https://translate.argosopentech.com/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q: text, source: 'en', target: lang, format: 'text' }),
+    });
+    if (!res.ok) throw new Error(`LibreTranslate failed: ${res.status}`);
+    const data = await res.json();
+    if (!data.translatedText) throw new Error('LibreTranslate returned no translation');
+    return data.translatedText;
+  },
+});
+
+const FALLBACK_ENGINES = [myMemory, libreTranslate];
+
+async function translateChunkViaFallbacks(cues, targetLang) {
+  for (const engine of FALLBACK_ENGINES) {
+    const result = await engine.translateChunk(cues, targetLang);
+    if (result) return result;
+  }
+  // Every fallback is either down or in cooldown — give up gracefully.
+  return cues.map(c => c.text);
+}
+
+// --- Google (primary) ----------------------------------------------------
+
+let googleBlockedUntil = 0;
 
 function chunkCues(cues) {
   const chunks = [];
@@ -68,36 +132,35 @@ function chunkCues(cues) {
 async function translateChunk(cues, targetLang) {
   const joined = cues.map(c => c.text.replace(/\r?\n/g, ' ')).join(SEPARATOR);
 
-  let lastErr;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const { text } = await translate(joined, { to: targetLang });
-      const parts = text.split(SEPARATOR.trim());
+  if (Date.now() >= googleBlockedUntil) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const { text } = await translate(joined, { to: targetLang });
+        await sleep(500); // pace even successful calls
+        const parts = text.split(SEPARATOR.trim());
 
-      // Fallback: if the separator got mangled by translation, split by line count
-      if (parts.length !== cues.length) {
-        const fallbackParts = text.split(/\n+/).filter(Boolean);
-        return cues.map((c, i) => fallbackParts[i] || c.text);
+        if (parts.length !== cues.length) {
+          const fallbackParts = text.split(/\n+/).filter(Boolean);
+          return cues.map((c, i) => fallbackParts[i] || c.text);
+        }
+        return parts.map(p => p.trim());
+      } catch (err) {
+        if (!isRateLimitError(err)) break;
+        if (attempt === MAX_RETRIES) {
+          console.error('Google rate-limited us repeatedly — cooling down for 60s.');
+          googleBlockedUntil = Date.now() + COOLDOWN_MS;
+          break;
+        }
+        const waitMs = 1500 * Math.pow(2, attempt); // 1.5s, 3s
+        console.log(`Rate limited by Google, retrying in ${waitMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})...`);
+        await sleep(waitMs);
       }
-      return parts.map(p => p.trim());
-    } catch (err) {
-      lastErr = err;
-      const isRateLimit = /Too Many Requests|429/i.test(err.message || '');
-      if (!isRateLimit || attempt === MAX_RETRIES) break;
-      const waitMs = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
-      console.log(`Rate limited by translate endpoint, retrying in ${waitMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})...`);
-      await sleep(waitMs);
     }
+  } else {
+    console.log('Google still in cooldown, skipping straight to fallbacks.');
   }
-  // Google gave up after retries — try MyMemory as a last resort before
-  // accepting defeat and leaving this chunk untranslated.
-  console.error('Google Translate failed after retries, trying MyMemory fallback:', lastErr?.message);
-  try {
-    return await translateChunkViaMyMemory(cues, targetLang);
-  } catch (fallbackErr) {
-    console.error('MyMemory fallback also failed:', fallbackErr.message);
-    return cues.map(c => c.text);
-  }
+
+  return translateChunkViaFallbacks(cues, targetLang);
 }
 
 async function translateAllChunks(chunks, targetLang) {
