@@ -2,6 +2,7 @@ import AdmZip from 'adm-zip';
 
 const OS_BASE = 'https://api.opensubtitles.com/api/v1';
 const SUBDL_BASE = 'https://api.subdl.com/api/v1/subtitles';
+const MAX_CANDIDATES = 4;
 
 function osHeaders() {
   return {
@@ -11,9 +12,13 @@ function osHeaders() {
   };
 }
 
+function subdlEnabled() {
+  return !!process.env.SUBDL_API_KEY;
+}
+
 // ---------- OpenSubtitles (primary source) ----------
 
-async function searchBestOnOpenSubtitles(imdbId, season, episode) {
+async function searchOpenSubtitles(imdbId, season, episode) {
   const params = new URLSearchParams({
     imdb_id: imdbId.replace('tt', ''),
     languages: 'en',
@@ -28,26 +33,10 @@ async function searchBestOnOpenSubtitles(imdbId, season, episode) {
     throw new Error(`OpenSubtitles search failed: ${searchRes.status} ${await searchRes.text()}`);
   }
   const searchData = await searchRes.json();
-  return searchData.data?.[0] || null;
+  return searchData.data || [];
 }
 
-async function hasOnOpenSubtitles(imdbId, season, episode) {
-  try {
-    const best = await searchBestOnOpenSubtitles(imdbId, season, episode);
-    return !!best?.attributes?.files?.[0]?.file_id;
-  } catch (err) {
-    console.error('OpenSubtitles existence check failed:', err.message);
-    return false;
-  }
-}
-
-async function downloadFromOpenSubtitles(imdbId, season, episode) {
-  const best = await searchBestOnOpenSubtitles(imdbId, season, episode);
-  if (!best) return null;
-
-  const fileId = best.attributes.files?.[0]?.file_id;
-  if (!fileId) return null;
-
+async function downloadFromOpenSubtitles(fileId) {
   const downloadRes = await fetch(`${OS_BASE}/download`, {
     method: 'POST',
     headers: osHeaders(),
@@ -67,10 +56,6 @@ async function downloadFromOpenSubtitles(imdbId, season, episode) {
 // Free API, requires a free API key from subdl.com/panel/api. Subtitles are
 // served as .zip files, so we need to extract the .srt from inside.
 
-function subdlEnabled() {
-  return !!process.env.SUBDL_API_KEY;
-}
-
 async function searchBestOnSubDL(imdbId, season, episode) {
   const params = new URLSearchParams({
     api_key: process.env.SUBDL_API_KEY,
@@ -89,24 +74,8 @@ async function searchBestOnSubDL(imdbId, season, episode) {
   return data.subtitles?.[0] || null;
 }
 
-async function hasOnSubDL(imdbId, season, episode) {
-  if (!subdlEnabled()) return false;
-  try {
-    const best = await searchBestOnSubDL(imdbId, season, episode);
-    return !!best?.url;
-  } catch (err) {
-    console.error('SubDL existence check failed:', err.message);
-    return false;
-  }
-}
-
-async function downloadFromSubDL(imdbId, season, episode) {
-  if (!subdlEnabled()) return null;
-  const best = await searchBestOnSubDL(imdbId, season, episode);
-  if (!best?.url) return null;
-
-  // best.url is a relative path; SubDL serves the actual file from dl.subdl.com
-  const zipUrl = best.url.startsWith('http') ? best.url : `https://dl.subdl.com${best.url}`;
+async function downloadFromSubDL(url) {
+  const zipUrl = url.startsWith('http') ? url : `https://dl.subdl.com${url}`;
   const zipRes = await fetch(zipUrl);
   if (!zipRes.ok) throw new Error(`Failed to download SubDL zip: ${zipRes.status}`);
 
@@ -118,37 +87,45 @@ async function downloadFromSubDL(imdbId, season, episode) {
   return srtEntry.getData().toString('utf-8');
 }
 
-// ---------- Public API: tries OpenSubtitles first, falls back to SubDL ----------
+// ---------- Public API ----------
 
 /**
- * Fast check (search only, no download) used to decide whether to even
- * offer a Hebrew subtitle option in the subtitles list.
+ * Returns up to MAX_CANDIDATES distinct English-subtitle candidates for this
+ * title (mostly from OpenSubtitles, topped up with a SubDL result if there's
+ * room), WITHOUT downloading any of them yet. Each candidate is a small
+ * descriptor {source, fileId|url} that downloadCandidate() can resolve later.
+ * Offering several candidates lets the person try another one if the first
+ * turns out to be the wrong language or badly out of sync.
  */
-export async function hasEnglishSubtitle(imdbId, season, episode) {
-  if (await hasOnOpenSubtitles(imdbId, season, episode)) return true;
-  return hasOnSubDL(imdbId, season, episode);
-}
+export async function getCandidates(imdbId, season, episode) {
+  const candidates = [];
 
-/**
- * Searches OpenSubtitles first; if that fails or finds nothing, falls back
- * to SubDL. Returns the raw .srt text, or null if neither source has it.
- */
-export async function fetchEnglishSrt(imdbId, season, episode) {
   try {
-    const fromOS = await downloadFromOpenSubtitles(imdbId, season, episode);
-    if (fromOS) return fromOS;
+    const results = await searchOpenSubtitles(imdbId, season, episode);
+    for (const r of results) {
+      const fileId = r.attributes?.files?.[0]?.file_id;
+      if (fileId) candidates.push({ source: 'opensubtitles', fileId });
+      if (candidates.length >= MAX_CANDIDATES) break;
+    }
   } catch (err) {
-    console.error('OpenSubtitles fetch failed, trying SubDL fallback:', err.message);
+    console.error('OpenSubtitles search failed:', err.message);
   }
 
-  if (subdlEnabled()) {
+  if (candidates.length < MAX_CANDIDATES && subdlEnabled()) {
     try {
-      const fromSubDL = await downloadFromSubDL(imdbId, season, episode);
-      if (fromSubDL) return fromSubDL;
+      const best = await searchBestOnSubDL(imdbId, season, episode);
+      if (best?.url) candidates.push({ source: 'subdl', url: best.url });
     } catch (err) {
-      console.error('SubDL fallback also failed:', err.message);
+      console.error('SubDL search failed:', err.message);
     }
   }
 
+  return candidates;
+}
+
+/** Downloads the actual .srt text for one candidate returned by getCandidates(). */
+export async function downloadCandidate(candidate) {
+  if (candidate.source === 'opensubtitles') return downloadFromOpenSubtitles(candidate.fileId);
+  if (candidate.source === 'subdl') return downloadFromSubDL(candidate.url);
   return null;
 }

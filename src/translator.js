@@ -9,11 +9,41 @@ const parser = new SrtParser2();
 // back apart. This keeps translation of a full movie to a handful of calls.
 const BATCH_CHAR_LIMIT = 4000;
 const SEPARATOR = '\n@@|@@\n';
-const CONCURRENCY = 2; // lower concurrency = gentler on Google's unofficial endpoint
+const CONCURRENCY = 1; // fully serial — gentlest possible on the unofficial endpoint
 const MAX_RETRIES = 3;
+
+// MyMemory doesn't need an API key and has its own independent (small) free
+// quota, so it's a reasonable last-resort when Google is rate-limiting hard.
+// It only accepts short-ish text per request, so we translate cue-by-cue.
+const MYMEMORY_LANG = { iw: 'he', he: 'he' };
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function translateViaMyMemory(text, targetLang) {
+  const lang = MYMEMORY_LANG[targetLang] || targetLang;
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|${lang}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`MyMemory failed: ${res.status}`);
+  const data = await res.json();
+  const translated = data.responseData?.translatedText;
+  if (!translated) throw new Error('MyMemory returned no translation');
+  return translated;
+}
+
+async function translateChunkViaMyMemory(cues, targetLang) {
+  const results = [];
+  for (const cue of cues) {
+    try {
+      const text = await translateViaMyMemory(cue.text.replace(/\r?\n/g, ' '), targetLang);
+      results.push(text);
+    } catch (err) {
+      console.error('MyMemory fallback failed for a line:', err.message);
+      results.push(cue.text); // give up on just this one line, keep going
+    }
+  }
+  return results;
 }
 
 function chunkCues(cues) {
@@ -59,10 +89,15 @@ async function translateChunk(cues, targetLang) {
       await sleep(waitMs);
     }
   }
-  // Give up gracefully: return original (untranslated) text rather than
-  // failing the whole subtitle file over one bad chunk.
-  console.error('Translation chunk failed after retries:', lastErr?.message);
-  return cues.map(c => c.text);
+  // Google gave up after retries — try MyMemory as a last resort before
+  // accepting defeat and leaving this chunk untranslated.
+  console.error('Google Translate failed after retries, trying MyMemory fallback:', lastErr?.message);
+  try {
+    return await translateChunkViaMyMemory(cues, targetLang);
+  } catch (fallbackErr) {
+    console.error('MyMemory fallback also failed:', fallbackErr.message);
+    return cues.map(c => c.text);
+  }
 }
 
 async function translateAllChunks(chunks, targetLang) {
