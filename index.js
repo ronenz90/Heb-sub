@@ -15,7 +15,7 @@ app.use((req, res, next) => {
 
 const manifest = {
   id: 'org.hebrewlivesubs.addon',
-  version: '1.4.0',
+  version: '1.4.1',
   name: 'A-HEBSUB By Ronen.z',
   description: 'לוקח כתוביות אנגלית קיימות ומתרגם אותן לעברית תוך כדי צפייה',
   logo: 'https://em-content.zobj.net/source/microsoft-teams/363/flag-israel_1f1ee-1f1f1.png',
@@ -49,7 +49,7 @@ function parseIdParam(rawIdParam) {
 // instead of each independently hitting sources/Google Translate.
 const inFlight = new Map();
 
-async function getOrBuildTranslatedSrt(cacheKey, candidate) {
+async function getOrBuildTranslatedSrt(cacheKey, candidate, imdbId, season, episode) {
   const cached = getCached(cacheKey);
   if (cached) return cached;
 
@@ -58,7 +58,7 @@ async function getOrBuildTranslatedSrt(cacheKey, candidate) {
   const buildPromise = (async () => {
     try {
       console.log(`[${cacheKey}] Downloading candidate (${candidate.source})...`);
-      const englishSrt = await downloadCandidate(candidate);
+      const englishSrt = await downloadCandidate(candidate, imdbId, season, episode);
       if (!englishSrt) {
         console.log(`[${cacheKey}] Candidate download returned nothing`);
         return null;
@@ -142,7 +142,7 @@ app.get('/subs/:type/:idParam', async (req, res) => {
       const candidate = candidates[candidateIndex];
       if (!candidate) return res.status(404).send('Candidate not found');
 
-      const srt = await getOrBuildTranslatedSrt(cacheKey, candidate);
+      const srt = await getOrBuildTranslatedSrt(cacheKey, candidate, imdbId, season, episode);
       if (!srt) return res.status(404).send('No subtitle available');
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       return res.send(srt);
