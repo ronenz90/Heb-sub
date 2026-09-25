@@ -149,6 +149,8 @@ async function translateChunkViaFallbacks(cues, targetLang) {
 
 const GEMMA_URL = 'https://gemma-i7on.onrender.com/generate';
 const GEMMA_TIMEOUT_MS = 60_000;
+const GEMMA_SUB_BATCH_SIZE = 12; // small batches so the model doesn't run out of output tokens mid-response
+const GEMMA_MAX_TOKENS = 4000;  // generous headroom — Hebrew output tends to use more tokens than the English input
 
 let gemmaBlockedUntil = 0;
 let gemmaConsecutiveFailures = 0;
@@ -157,12 +159,12 @@ function gemmaEnabled() {
   return !!process.env.GEMMA_API_KEY;
 }
 
-async function translateChunkViaGemma(cues, targetLang) {
+async function translateSubBatchViaGemma(cues, targetLang) {
   const langName = targetLang === 'iw' || targetLang === 'he' ? 'Hebrew' : targetLang;
   const sep = SEPARATOR.trim();
   const joined = cues.map(c => c.text.replace(/\r?\n/g, ' ')).join(SEPARATOR);
   const prompt =
-    `Translate each of the following subtitle lines to ${langName}. ` +
+    `Translate each of the following ${cues.length} subtitle lines to ${langName}. ` +
     `The lines are separated by the exact token "${sep}". ` +
     `Return ONLY the translations, in the exact same order, separated by that exact same token "${sep}". ` +
     `Do not add numbering, quotes, explanations, or anything else — output only the translated lines and separators.\n\n${joined}`;
@@ -176,7 +178,7 @@ async function translateChunkViaGemma(cues, targetLang) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         prompt,
-        max_tokens: 2000,
+        max_tokens: GEMMA_MAX_TOKENS,
         temperature: 0.3,
         system: 'You are a precise subtitle translator. Follow the formatting instructions exactly and output nothing else.',
       }),
@@ -194,19 +196,29 @@ async function translateChunkViaGemma(cues, targetLang) {
     const text = data.response;
     if (!text) throw new Error('Gemma returned no response text');
 
-    gemmaConsecutiveFailures = 0;
-
     const parts = text.split(sep);
-    if (parts.length === cues.length) {
-      return parts.map(p => p.trim());
-    }
+    if (parts.length === cues.length) return parts.map(p => p.trim());
+
     const fallbackParts = text.split(/\n+/).filter(Boolean);
-    if (fallbackParts.length === cues.length) {
-      return fallbackParts.map(p => p.trim());
-    }
-    throw new Error(`Gemma returned ${parts.length} parts, expected ${cues.length} — output likely malformed`);
-  } catch (err) {
+    if (fallbackParts.length === cues.length) return fallbackParts.map(p => p.trim());
+
+    throw new Error(`Gemma returned ${parts.length} parts, expected ${cues.length} — output likely truncated or malformed`);
+  } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+async function translateChunkViaGemma(cues, targetLang) {
+  try {
+    const results = [];
+    for (let i = 0; i < cues.length; i += GEMMA_SUB_BATCH_SIZE) {
+      const subBatch = cues.slice(i, i + GEMMA_SUB_BATCH_SIZE);
+      const translated = await translateSubBatchViaGemma(subBatch, targetLang);
+      results.push(...translated);
+    }
+    gemmaConsecutiveFailures = 0;
+    return results;
+  } catch (err) {
     gemmaConsecutiveFailures++;
     const rateLimited = err.isRateLimit;
     const tooManyFailures = gemmaConsecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT;
@@ -219,7 +231,7 @@ async function translateChunkViaGemma(cues, targetLang) {
     } else {
       console.error('Gemma failed for this chunk:', err.message);
     }
-    return null; // signal "try the next engine"
+    return null; // signal "try the next engine" (whole chunk falls through — no mixed partial results)
   }
 }
 
