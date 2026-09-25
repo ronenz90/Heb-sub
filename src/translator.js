@@ -208,7 +208,25 @@ async function translateSubBatchViaGemma(cues, targetLang) {
   }
 }
 
+// Different candidates (or list requests) can each kick off their own
+// translation independently, so without this, two of them could hit Gemma
+// at the same time. If Gemma only serves one inference at a time, that
+// queues the second request behind the first and can blow past even a
+// generous timeout. This ensures the whole server only ever has one Gemma
+// call in flight, and everything else waits its turn.
+let gemmaQueue = Promise.resolve();
+
+function withGemmaQueue(fn) {
+  const run = gemmaQueue.then(fn, fn); // run after the previous one settles, even if it failed
+  gemmaQueue = run.catch(() => {}); // don't let a rejection break the chain for the next caller
+  return run;
+}
+
 async function translateChunkViaGemma(cues, targetLang) {
+  return withGemmaQueue(() => translateChunkViaGemmaImpl(cues, targetLang));
+}
+
+async function translateChunkViaGemmaImpl(cues, targetLang) {
   try {
     const results = [];
     for (let i = 0; i < cues.length; i += GEMMA_SUB_BATCH_SIZE) {
