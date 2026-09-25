@@ -139,7 +139,91 @@ async function translateChunkViaFallbacks(cues, targetLang) {
   return cues.map(c => c.text);
 }
 
-// --- Google (primary) ----------------------------------------------------
+// --- Gemma (top priority when configured) --------------------------------
+// Your own hosted model. It's an LLM, not a dedicated translation API, so we
+// ask it to translate a batch of separator-joined lines and return them in
+// the same order/format — same trick as Google, but LLM output is less
+// strictly guaranteed to match, so we validate the count before trusting it
+// and fall through if it doesn't line up. Also gets a long timeout since
+// your Render instance can be asleep and take a while to wake up.
+
+const GEMMA_URL = 'https://gemma-i7on.onrender.com/generate';
+const GEMMA_TIMEOUT_MS = 60_000;
+
+let gemmaBlockedUntil = 0;
+let gemmaConsecutiveFailures = 0;
+
+function gemmaEnabled() {
+  return !!process.env.GEMMA_API_KEY;
+}
+
+async function translateChunkViaGemma(cues, targetLang) {
+  const langName = targetLang === 'iw' || targetLang === 'he' ? 'Hebrew' : targetLang;
+  const sep = SEPARATOR.trim();
+  const joined = cues.map(c => c.text.replace(/\r?\n/g, ' ')).join(SEPARATOR);
+  const prompt =
+    `Translate each of the following subtitle lines to ${langName}. ` +
+    `The lines are separated by the exact token "${sep}". ` +
+    `Return ONLY the translations, in the exact same order, separated by that exact same token "${sep}". ` +
+    `Do not add numbering, quotes, explanations, or anything else — output only the translated lines and separators.\n\n${joined}`;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GEMMA_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(`${GEMMA_URL}?api_key=${encodeURIComponent(process.env.GEMMA_API_KEY)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        max_tokens: 2000,
+        temperature: 0.3,
+        system: 'You are a precise subtitle translator. Follow the formatting instructions exactly and output nothing else.',
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      const err = new Error(`Gemma failed: ${res.status} ${await res.text()}`);
+      err.isRateLimit = res.status === 429;
+      throw err;
+    }
+
+    const data = await res.json();
+    const text = data.response;
+    if (!text) throw new Error('Gemma returned no response text');
+
+    gemmaConsecutiveFailures = 0;
+
+    const parts = text.split(sep);
+    if (parts.length === cues.length) {
+      return parts.map(p => p.trim());
+    }
+    const fallbackParts = text.split(/\n+/).filter(Boolean);
+    if (fallbackParts.length === cues.length) {
+      return fallbackParts.map(p => p.trim());
+    }
+    throw new Error(`Gemma returned ${parts.length} parts, expected ${cues.length} — output likely malformed`);
+  } catch (err) {
+    clearTimeout(timeoutId);
+    gemmaConsecutiveFailures++;
+    const rateLimited = err.isRateLimit;
+    const tooManyFailures = gemmaConsecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT;
+
+    if (rateLimited || tooManyFailures) {
+      const cooldown = rateLimited ? COOLDOWN_MS : NETWORK_FAILURE_COOLDOWN_MS;
+      console.error(`Gemma unavailable (${err.message}) — cooling down for ${cooldown / 1000}s.`);
+      gemmaBlockedUntil = Date.now() + cooldown;
+      gemmaConsecutiveFailures = 0;
+    } else {
+      console.error('Gemma failed for this chunk:', err.message);
+    }
+    return null; // signal "try the next engine"
+  }
+}
+
+// --- Google (secondary) ---------------------------------------------------
 
 let googleBlockedUntil = 0;
 let googleConsecutiveFailures = 0;
@@ -163,7 +247,7 @@ function chunkCues(cues) {
   return chunks;
 }
 
-async function translateChunk(cues, targetLang) {
+async function translateChunkViaGoogle(cues, targetLang) {
   const joined = cues.map(c => c.text.replace(/\r?\n/g, ' ')).join(SEPARATOR);
 
   if (Date.now() >= googleBlockedUntil) {
@@ -204,6 +288,19 @@ async function translateChunk(cues, targetLang) {
   }
 
   return translateChunkViaFallbacks(cues, targetLang);
+}
+
+async function translateChunk(cues, targetLang) {
+  if (gemmaEnabled()) {
+    if (Date.now() >= gemmaBlockedUntil) {
+      const result = await translateChunkViaGemma(cues, targetLang);
+      if (result) return result;
+      // null means Gemma failed/cooled down this round — fall through to Google.
+    } else {
+      console.log('Gemma still in cooldown, skipping to Google.');
+    }
+  }
+  return translateChunkViaGoogle(cues, targetLang);
 }
 
 async function translateAllChunks(chunks, targetLang) {
