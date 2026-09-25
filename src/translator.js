@@ -148,7 +148,7 @@ async function translateChunkViaFallbacks(cues, targetLang) {
 // your Render instance can be asleep and take a while to wake up.
 
 const GEMMA_URL = 'https://gemma-i7on.onrender.com/generate';
-const GEMMA_TIMEOUT_MS = 60_000;
+const GEMMA_TIMEOUT_MS = 120_000; // LLM cold start (server wake + model load into memory) can take well over a minute
 const GEMMA_SUB_BATCH_SIZE = 12; // small batches so the model doesn't run out of output tokens mid-response
 const GEMMA_MAX_TOKENS = 4000;  // generous headroom — Hebrew output tends to use more tokens than the English input
 
