@@ -128,10 +128,11 @@ const libreTranslate = makeEngine({
   },
 });
 
-const FALLBACK_ENGINES = [myMemory, libreTranslate];
-
 async function translateChunkViaFallbacks(cues, targetLang) {
-  for (const engine of FALLBACK_ENGINES) {
+  // Gemma goes last: it's reliable but very slow on the free-tier CPU host
+  // (tens of seconds per line), so faster free options get a chance first.
+  const engines = gemmaEnabled() ? [myMemory, libreTranslate, gemma] : [myMemory, libreTranslate];
+  for (const engine of engines) {
     const result = await engine.translateChunk(cues, targetLang);
     if (result) return result;
   }
@@ -139,7 +140,7 @@ async function translateChunkViaFallbacks(cues, targetLang) {
   return cues.map(c => c.text);
 }
 
-// --- Gemma (top priority when configured) --------------------------------
+// --- Gemma (last resort when configured — see note above) ----------------
 // Your own hosted model. Batching multiple lines into one prompt turned out
 // to be unreliable — the model doesn't reliably keep a 1:1 line count, so
 // counts came back wrong in both directions (truncated OR inflated). Instead
@@ -207,7 +208,9 @@ async function translateOneViaGemma(text, targetLang) {
   }
 }
 
-// --- Google (secondary) ---------------------------------------------------
+// --- Google (primary) ------------------------------------------------------
+// Tried first for every chunk; falls through to MyMemory, then LibreTranslate,
+// then (if configured) Gemma last, since Gemma is reliable but very slow.
 
 let googleBlockedUntil = 0;
 let googleConsecutiveFailures = 0;
@@ -231,7 +234,7 @@ function chunkCues(cues) {
   return chunks;
 }
 
-async function translateChunkViaGoogle(cues, targetLang) {
+async function translateChunk(cues, targetLang) {
   const joined = cues.map(c => c.text.replace(/\r?\n/g, ' ')).join(SEPARATOR);
 
   if (Date.now() >= googleBlockedUntil) {
@@ -274,14 +277,7 @@ async function translateChunkViaGoogle(cues, targetLang) {
   return translateChunkViaFallbacks(cues, targetLang);
 }
 
-async function translateChunk(cues, targetLang) {
-  if (gemmaEnabled()) {
-    const result = await gemma.translateChunk(cues, targetLang);
-    if (result) return result;
-    // null means Gemma is in cooldown or just failed this round — fall through to Google.
-  }
-  return translateChunkViaGoogle(cues, targetLang);
-}
+
 
 async function translateAllChunks(chunks, targetLang) {
   const results = new Array(chunks.length);
