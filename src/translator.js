@@ -140,34 +140,43 @@ async function translateChunkViaFallbacks(cues, targetLang) {
 }
 
 // --- Gemma (top priority when configured) --------------------------------
-// Your own hosted model. It's an LLM, not a dedicated translation API, so we
-// ask it to translate a batch of separator-joined lines and return them in
-// the same order/format — same trick as Google, but LLM output is less
-// strictly guaranteed to match, so we validate the count before trusting it
-// and fall through if it doesn't line up. Also gets a long timeout since
-// your Render instance can be asleep and take a while to wake up.
+// Your own hosted model. Batching multiple lines into one prompt turned out
+// to be unreliable — the model doesn't reliably keep a 1:1 line count, so
+// counts came back wrong in both directions (truncated OR inflated). Instead
+// we translate one line per request, same reliable pattern as MyMemory/
+// LibreTranslate below (this reuses makeEngine, so it gets the same pacing
+// and circuit-breaker handling for free).
+//
+// A global queue also serializes every call so that even when several
+// candidates are translating "at once" from this server's point of view,
+// Gemma itself only ever sees one request at a time — if it can only run
+// one inference at a time, sending it two concurrently just queues the
+// second behind the first and can blow past any timeout.
 
 const GEMMA_URL = 'https://gemma-i7on.onrender.com/generate';
-const GEMMA_TIMEOUT_MS = 120_000; // LLM cold start (server wake + model load into memory) can take well over a minute
-const GEMMA_SUB_BATCH_SIZE = 12; // small batches so the model doesn't run out of output tokens mid-response
-const GEMMA_MAX_TOKENS = 4000;  // generous headroom — Hebrew output tends to use more tokens than the English input
-
-let gemmaBlockedUntil = 0;
-let gemmaConsecutiveFailures = 0;
+const GEMMA_TIMEOUT_MS = 45_000;
 
 function gemmaEnabled() {
   return !!process.env.GEMMA_API_KEY;
 }
 
-async function translateSubBatchViaGemma(cues, targetLang) {
+let gemmaQueue = Promise.resolve();
+
+function withGemmaQueue(fn) {
+  const run = gemmaQueue.then(fn, fn); // run after the previous one settles, even if it failed
+  gemmaQueue = run.catch(() => {}); // don't let a rejection break the chain for the next caller
+  return run;
+}
+
+const gemma = makeEngine({
+  name: 'Gemma',
+  paceMs: 200, // the queue already serializes calls; this is just a little breathing room
+  translateOne: (text, targetLang) => withGemmaQueue(() => translateOneViaGemma(text, targetLang)),
+});
+
+async function translateOneViaGemma(text, targetLang) {
   const langName = targetLang === 'iw' || targetLang === 'he' ? 'Hebrew' : targetLang;
-  const sep = SEPARATOR.trim();
-  const joined = cues.map(c => c.text.replace(/\r?\n/g, ' ')).join(SEPARATOR);
-  const prompt =
-    `Translate each of the following ${cues.length} subtitle lines to ${langName}. ` +
-    `The lines are separated by the exact token "${sep}". ` +
-    `Return ONLY the translations, in the exact same order, separated by that exact same token "${sep}". ` +
-    `Do not add numbering, quotes, explanations, or anything else — output only the translated lines and separators.\n\n${joined}`;
+  const prompt = `Translate the following subtitle line to ${langName}. Output ONLY the translation — no quotes, no explanation, nothing else.\n\n${text}`;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), GEMMA_TIMEOUT_MS);
@@ -178,78 +187,23 @@ async function translateSubBatchViaGemma(cues, targetLang) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         prompt,
-        max_tokens: GEMMA_MAX_TOKENS,
+        max_tokens: 300,
         temperature: 0.3,
-        system: 'You are a precise subtitle translator. Follow the formatting instructions exactly and output nothing else.',
+        system: 'You are a precise subtitle translator. Output only the requested translation, nothing else.',
       }),
       signal: controller.signal,
     });
-    clearTimeout(timeoutId);
-
     if (!res.ok) {
       const err = new Error(`Gemma failed: ${res.status} ${await res.text()}`);
       err.isRateLimit = res.status === 429;
       throw err;
     }
-
     const data = await res.json();
-    const text = data.response;
-    if (!text) throw new Error('Gemma returned no response text');
-
-    const parts = text.split(sep);
-    if (parts.length === cues.length) return parts.map(p => p.trim());
-
-    const fallbackParts = text.split(/\n+/).filter(Boolean);
-    if (fallbackParts.length === cues.length) return fallbackParts.map(p => p.trim());
-
-    throw new Error(`Gemma returned ${parts.length} parts, expected ${cues.length} — output likely truncated or malformed`);
+    const result = data.response?.trim();
+    if (!result) throw new Error('Gemma returned no response text');
+    return result;
   } finally {
     clearTimeout(timeoutId);
-  }
-}
-
-// Different candidates (or list requests) can each kick off their own
-// translation independently, so without this, two of them could hit Gemma
-// at the same time. If Gemma only serves one inference at a time, that
-// queues the second request behind the first and can blow past even a
-// generous timeout. This ensures the whole server only ever has one Gemma
-// call in flight, and everything else waits its turn.
-let gemmaQueue = Promise.resolve();
-
-function withGemmaQueue(fn) {
-  const run = gemmaQueue.then(fn, fn); // run after the previous one settles, even if it failed
-  gemmaQueue = run.catch(() => {}); // don't let a rejection break the chain for the next caller
-  return run;
-}
-
-async function translateChunkViaGemma(cues, targetLang) {
-  return withGemmaQueue(() => translateChunkViaGemmaImpl(cues, targetLang));
-}
-
-async function translateChunkViaGemmaImpl(cues, targetLang) {
-  try {
-    const results = [];
-    for (let i = 0; i < cues.length; i += GEMMA_SUB_BATCH_SIZE) {
-      const subBatch = cues.slice(i, i + GEMMA_SUB_BATCH_SIZE);
-      const translated = await translateSubBatchViaGemma(subBatch, targetLang);
-      results.push(...translated);
-    }
-    gemmaConsecutiveFailures = 0;
-    return results;
-  } catch (err) {
-    gemmaConsecutiveFailures++;
-    const rateLimited = err.isRateLimit;
-    const tooManyFailures = gemmaConsecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT;
-
-    if (rateLimited || tooManyFailures) {
-      const cooldown = rateLimited ? COOLDOWN_MS : NETWORK_FAILURE_COOLDOWN_MS;
-      console.error(`Gemma unavailable (${err.message}) — cooling down for ${cooldown / 1000}s.`);
-      gemmaBlockedUntil = Date.now() + cooldown;
-      gemmaConsecutiveFailures = 0;
-    } else {
-      console.error('Gemma failed for this chunk:', err.message);
-    }
-    return null; // signal "try the next engine" (whole chunk falls through — no mixed partial results)
   }
 }
 
@@ -322,13 +276,9 @@ async function translateChunkViaGoogle(cues, targetLang) {
 
 async function translateChunk(cues, targetLang) {
   if (gemmaEnabled()) {
-    if (Date.now() >= gemmaBlockedUntil) {
-      const result = await translateChunkViaGemma(cues, targetLang);
-      if (result) return result;
-      // null means Gemma failed/cooled down this round — fall through to Google.
-    } else {
-      console.log('Gemma still in cooldown, skipping to Google.');
-    }
+    const result = await gemma.translateChunk(cues, targetLang);
+    if (result) return result;
+    // null means Gemma is in cooldown or just failed this round — fall through to Google.
   }
   return translateChunkViaGoogle(cues, targetLang);
 }
