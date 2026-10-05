@@ -202,9 +202,30 @@ async function translateOneViaGemma(text, targetLang) {
     const data = await res.json();
     const result = data.response?.trim();
     if (!result) throw new Error('Gemma returned no response text');
+    assertLooksLikeRealTranslation(result, targetLang);
     return result;
   } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+// Gemma's hosting server sometimes echoes back its own internal prompt
+// template (e.g. "* Source: ... * Target Language: ... * Constraint: ...")
+// instead of actually translating. That's not something we control from
+// here, so instead we validate the response and reject anything that looks
+// like template leakage or isn't actually in the target script, so it's
+// treated as a failure (and falls through / retries) rather than getting
+// cached as if it were a real translation.
+const TEMPLATE_LEAK_PATTERN = /\*\s*(Source|Target Language|Context|Constraint)\s*:/i;
+const HEBREW_CHAR_PATTERN = /[\u05D0-\u05EA]/;
+
+function assertLooksLikeRealTranslation(text, targetLang) {
+  if (TEMPLATE_LEAK_PATTERN.test(text)) {
+    throw new Error('Gemma response looks like leaked prompt template, not a translation');
+  }
+  const isHebrewTarget = targetLang === 'iw' || targetLang === 'he';
+  if (isHebrewTarget && !HEBREW_CHAR_PATTERN.test(text)) {
+    throw new Error('Gemma response contains no Hebrew characters — likely not a real translation');
   }
 }
 
